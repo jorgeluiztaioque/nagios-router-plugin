@@ -1,0 +1,325 @@
+#!/usr/bin/perl
+
+#===============================================================================
+#                               Configuration        
+#===============================================================================
+
+my $lastScriptModification = '2003-01-10';
+
+#===============================================================================
+#                              Initialization
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+#    Libraries
+#-------------------------------------------------------------------------------
+
+use Getopt::Std;
+use Net::SNMP qw(:snmp);
+
+
+#-------------------------------------------------------------------------------
+#    Global variable declarations
+#-------------------------------------------------------------------------------
+my (
+   # Working vars 
+   $usage,              # String containing usage help
+   $hostname,           # Hostname of machine being queried via SNMP
+   $community,          # SNMP community string to use for query
+   $ipAdEntIfIndex,     #                                       
+   $ifOperStatus,       #                                     
+   $base_oid,           #             
+   %router_interfaces,  # hash of interfaces 
+   %intf_states,        # hash of interface states
+   %intf_status,        # hash of interface statuses 
+   @interfaces,		# array to temporarily hold the list of interfaces
+   @up,			# list of interfaces that are up
+   @down,		# list of interfaces that are down
+   @unconfig,		# list of interfaces that are unconfigured
+   $message,            # the text message to return to netsaint
+   $state              # 2=critical, 1=warning, 0=ok, -1=error
+);
+
+#-------------------------------------------------------------------------------
+#    Global variable initializations
+#-------------------------------------------------------------------------------
+
+$usage = <<"EOF";
+usage:  $0 [-h] -r <hostname> -c <community> -i <interfaces> 
+
+[-h]             :       Print this message
+[-r] <router>    :       IP Address or Hostname of the router
+[-c] <community> :       SNMP Community String  (default = "public")
+[-i] <interfaces>:       comma-separated list of interface ip addresses 
+                         and descriptions.   Example:  10.1.1.1%ROUTER_A
+                               
+$lastScriptModification
+ 
+EOF
+
+%intf_states = (
+	"1" => "Up",
+	"2" => "Down",
+	"3" => "Testing",
+	"4" => "Unknown",		
+	"5" => "Dormant",		
+	"6" => "notPresent",		
+	"7" => "lowerLayerDown",		
+);
+
+$state = 0;
+
+$base_oid               = "0";
+$ipAdEntIfIndex         = "1.3.6.1.2.1.4.20.1.2";
+$ifOperStatus           = "1.3.6.1.2.1.2.2.1.8";
+
+#===============================================================================
+#                              Input Phase
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+# Check the usage
+#-------------------------------------------------------------------------------
+die $usage if (!getopts('hr:c:i:') || $opt_h);
+die $usage if (!$opt_r || !$opt_i || $opt_h);
+
+#-------------------------------------------------------------------------------
+# Set the args for the snmp session 
+#-------------------------------------------------------------------------------
+$hostname = $opt_r;
+$community = $opt_c || "public";
+
+#-------------------------------------------------------------------------------
+# Build a hash of Interfaces: key=ip_address, value=description
+#-------------------------------------------------------------------------------
+@interfaces = split(',', $opt_i);
+foreach my $interface (@interfaces) {
+	my @tmp = split('\%', $interface);  
+	push (@{$router_interfaces{$tmp[0]}}, $tmp[1]);
+}
+
+
+#-------------------------------------------------------------------------------
+# Open an SNMPv2 session with the router
+#-------------------------------------------------------------------------------
+my ($session, $error) = Net::SNMP->session(
+	-version     => 'snmpv2c',
+	-nonblocking => 1,
+	-timeout     => 2,
+    	-hostname    => $hostname,
+    	-community   => $community
+);
+
+if (!defined($session)) {
+	printf("ERROR: %s.\n", $error);
+	exit (-1);
+}
+
+
+#-------------------------------------------------------------------------------
+# Send a bulk request for the ipAdEntIfIndex table
+#-------------------------------------------------------------------------------
+$base_oid = $ipAdEntIfIndex;
+
+my $result = $session->get_bulk_request(
+	-callback       => [\&table_cb, {}],
+       	-maxrepetitions => 20,
+   	-varbindlist => [$base_oid]
+);
+
+if (!defined($result)) {
+	printf("ERROR: %s.\n", $session->error);
+	$session->close;
+	exit (-1);
+}
+
+#-------------------------------------------------------------------------------
+# Wait for the responses.  These will be handled by &table_cb...
+#-------------------------------------------------------------------------------
+snmp_dispatcher();
+
+#-------------------------------------------------------------------------------
+# Send a bulk request for the ifOperStatus table
+#-------------------------------------------------------------------------------
+$base_oid = $ifOperStatus;
+
+my $result = $session->get_bulk_request(
+	-callback       => [\&table_cb, {}],
+       	-maxrepetitions => 20,
+   	-varbindlist => [$base_oid]
+);
+
+if (!defined($result)) {
+	printf("ERROR: %s.\n", $session->error);
+	$session->close;
+	exit (-1);
+}
+
+#-------------------------------------------------------------------------------
+# Wait for the responses.  These will be handled by &table_cb...
+#-------------------------------------------------------------------------------
+snmp_dispatcher();
+
+
+#-------------------------------------------------------------------------------
+# Clean-up and exit.
+#-------------------------------------------------------------------------------
+$session->close;
+
+
+#===============================================================================
+#                              Output Phase
+#===============================================================================
+
+
+foreach my $interface (sort keys %router_interfaces) {
+
+	my $index = @{$router_interfaces{$interface}}[1] || -1;
+	my $description = @{$router_interfaces{$interface}}[0];
+	my $status = $intf_status{$index};
+
+	#print "description= $description\n";
+	#print "ifIndex= $index\n";
+	#print "ifOperStatus: $intf_states{$status}\n";
+
+	if (!defined($intf_states{$status})) {
+		push(@unconfig, $description);
+	} elsif ($status == 1) {
+		push(@up, $description);
+	} elsif ($status != 1) {
+		push(@down, $description);
+	}
+}
+
+# Set return state for script
+my $num_up = @up;
+my $num_down = @down;
+my $num_unconfig = @unconfig;
+
+if ($num_up) {
+	#print "num_up set: $num_up\n";
+	$state = 0;
+	if ($num_up > 1) {
+		my $list = join(',', @up);
+		$message = "Links to $list are Up";
+	} else {
+		$message = "Link to $up[0] is Up";
+	}
+}
+
+if ($num_unconfig) {
+	#print "num_unconfig set: $num_unconfig\n";
+	$state = 1;
+	if ($num_unconfig > 1) {
+		my $list = join(',', @unconfig);
+		$message = "Links to $list are Unconfigured";
+	} else {
+		$message = "Link to $unconfig[0] is unconfigured";
+	}
+}
+
+if ($num_down) {
+	#print "num_down set: $num_down\n";
+	$state = 2;
+	if ($num_down > 1) {
+		my $list = join(',', @down);
+		if ($num_unconfig) {
+			$message .= "/Links to $list are down";
+		} else {
+			$message = "Links to $list are down";
+		}
+	} else {
+		if ($num_unconfig) {
+			$message .= "/Link to $down[0] is down";
+		} else {
+			$message = "Link to $down[0] is down";
+		}
+	}
+} 
+
+print "$message\n";
+
+exit($state);
+
+
+#===============================================================================
+#                              Subroutines
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+# Subroutine to handle the SNMP responses.
+#-------------------------------------------------------------------------------
+sub table_cb 
+{
+	my ($session, $table) = @_;
+
+	if (!defined($session->var_bind_list)) {
+                printf("ERROR: %s\n", $session->error);
+
+	} else {
+
+		#---------------------------------------------------------------
+                # Loop through each of the OIDs in the response and assign
+                # the key/value pairs to the anonymous hash that is passed
+                # to the callback.  Make sure that we are still in the table
+                # before assigning the key/values.
+		#---------------------------------------------------------------
+
+                my $next;
+                foreach my $oid (oid_lex_sort(keys(%{$session->var_bind_list}))) {
+                   	if (!oid_base_match($base_oid, $oid)) {
+                      		$next = undef;
+                      		last;
+                   	}
+                   	$next = $oid;
+                   	$table->{$oid} = $session->var_bind_list->{$oid};
+                }
+
+		#---------------------------------------------------------------
+                # If $next is defined we need to send another request
+                # to get more of the table.
+		#---------------------------------------------------------------
+
+                if (defined($next)) {
+                   	$result = $session->get_bulk_request(
+                      		-callback       => [\&table_cb, $table],
+                      		-maxrepetitions => 10,
+                      		-varbindlist    => [$next]
+                   	);
+
+			if (!defined($result)) {
+                 		printf("ERROR: %s\n", $session->error);
+			}
+                } else {
+			#-------------------------------------------------------
+                   	# We are no longer in the table, so print the results.
+			#-------------------------------------------------------
+			my @interfaces; 
+                   	foreach my $oid (oid_lex_sort(keys(%{$table}))) {
+
+				#-----------------------------------------------
+				# Handle result from ipAdEntIfIndex walk                                                  
+				#-----------------------------------------------
+				if ($oid =~ /^$ipAdEntIfIndex.(\d+.\d+.\d+.\d+)$/) {
+					my $ip_addr = $1;
+
+					next unless defined ($router_interfaces{$ip_addr});
+					push (@{$router_interfaces{$ip_addr}}, $table->{$oid});
+					$intf_status{$ifIndex} = -1;
+
+					#print "@{$router_interfaces{$ip_addr}}[0] =  $table->{$oid}\n";
+
+
+				#-----------------------------------------------
+				# Handle result from ifOperStatus walk                                                  
+				#-----------------------------------------------
+				} elsif ($oid =~ /^$ifOperStatus.(\d+)$/) {
+					my $ifIndex = $1;
+					$intf_status{$ifIndex} = $table->{$oid};
+				}
+				
+			}
+                }
+	}
+}
+

@@ -1,0 +1,270 @@
+#!/usr/bin/perl
+
+#===============================================================================
+#                               Configuration        
+#===============================================================================
+
+my $lastScriptModification = '2002-11-24';
+
+#===============================================================================
+#                              Initialization
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+#    Libraries
+#-------------------------------------------------------------------------------
+
+use Getopt::Std;
+use Net::SNMP qw(:snmp);
+
+
+#-------------------------------------------------------------------------------
+#    Global var declarations
+#-------------------------------------------------------------------------------
+my (
+   # Working vars 
+   $usage,              # String containing usage help
+   $hostname,           # Hostname of machine being queried via SNMP
+   $community,          # SNMP community string to use for query
+   $base_oid,           # BGP Neighbor State OID 
+   %bgp_neighbors,      # hash of BGP neighbors
+   %bgp_states,         # hash of SNMP BGP states
+   @neighbors,		# array to temporarily hold the list of neighbors
+   @up,			# list of neighbors that are up
+   @down,		# list of neighbors that are down
+   @ne,			# list of neighbors that are not configured
+   $message,            # the text message to return to netsaint
+   $state              # 2=critical, 1=warning, 0=ok, -1=error
+);
+
+#-------------------------------------------------------------------------------
+#    Global var initializations
+#-------------------------------------------------------------------------------
+
+$usage = <<"EOF";
+usage:  $0 [-h] -r <hostname> -c <community> -n <neighbors> 
+
+[-h]            :       Print this message
+[-r] <router>   :       IP Address or Hostname of the router
+[-c] <community>:       SNMP Community String  (default = "public")
+[-n] <neighbors>:       % delimited list of neighbor ip addresses 
+                        and descriptions.   Example:  10.10.10.1%ROUTER_A
+                               
+$lastScriptModification
+ 
+EOF
+
+%bgp_states = (
+	"1" => "Idle",
+	"2" => "Connect",
+	"3" => "Active",		
+	"4" => "OpenSent",
+	"5" => "OpenConfirm",
+	"6" => "Established"
+);
+
+$state = 0;
+
+#===============================================================================
+#                              Input Phase
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+# Check the usage
+#-------------------------------------------------------------------------------
+die $usage if (!getopts('hr:c:n:') || $opt_h);
+die $usage if (!$opt_r || !$opt_n || $opt_h);
+
+#-------------------------------------------------------------------------------
+# Set the args for the snmp session 
+#-------------------------------------------------------------------------------
+$hostname = $opt_r;
+$community = $opt_c || "public";
+$base_oid = "1.3.6.1.2.1.15.3.1.2";
+
+#-------------------------------------------------------------------------------
+# Build a hash of BGP neighbors: key=ip_address, value=description
+#-------------------------------------------------------------------------------
+@neighbors = split(',', $opt_n);
+foreach my $neighbor (@neighbors) {
+	my @tmp = split('\%', $neighbor);  
+	$bgp_neighbors{$tmp[0]} = $tmp[1];
+}
+
+
+#-------------------------------------------------------------------------------
+# Open an SNMPv2 session with the router
+#-------------------------------------------------------------------------------
+my ($session, $error) = Net::SNMP->session(
+	-version     => 'snmpv2c',
+	-nonblocking => 1,
+	-timeout     => 2,
+    	-hostname    => $hostname,
+    	-community   => $community
+);
+
+if (!defined($session)) {
+	printf("ERROR: %s.\n", $error);
+	exit (-1);
+}
+
+
+#-------------------------------------------------------------------------------
+# Send a bulk request for the bgp neighbor table
+#-------------------------------------------------------------------------------
+my $result = $session->get_bulk_request(
+	-callback       => [\&table_cb, {}],
+       	-maxrepetitions => 10,
+   	-varbindlist => [$base_oid]
+);
+
+if (!defined($result)) {
+	printf("ERROR: %s.\n", $session->error);
+	$session->close;
+	exit (-1);
+}
+
+#===============================================================================
+#                              Output Phase
+#===============================================================================
+
+
+#-------------------------------------------------------------------------------
+# Wait for the responses.  These will be handled by &table_cb...
+#-------------------------------------------------------------------------------
+snmp_dispatcher();
+
+#-------------------------------------------------------------------------------
+# Clean-up and exit.
+#-------------------------------------------------------------------------------
+$session->close;
+
+#---------------------------------------------------------------
+# If there are any neighbors left in the has, it means that 
+# we were supposed to report on the status, but the neighbor
+# wasn't in the bgp neighbors table.  We'll assume this means 
+# the neighbor is down.
+#---------------------------------------------------------------
+foreach my $neighbor (keys %bgp_neighbors) {
+	#print "BGP to $bgp_neighbors{$neighbor} is Unconfigured\n";
+	push(@ne, $bgp_neighbors{$neighbor});
+	$state = 2;
+}
+
+
+if ($state == 0) { 
+	my $num_up = @up;
+	my $list = join(',', @up);
+	if ($num_up > 1) {
+		$message = "BGP to $list are Up";
+	} else {
+		$message = "BGP to $list is Up";
+	}
+		
+} else {
+	my $num_ne = @ne;
+	my $num_down = @down;
+
+	if ($num_ne) {
+		my $list = join(',', @ne);
+		$message = "BGP to $list is Unconfigured, ";
+	}
+	if ($num_down) {
+		my $list = join(',', @down);
+		$message .= "BGP to $list is DOWN";
+	}
+}
+
+print "$message\n";
+
+exit($state);
+
+
+#===============================================================================
+#                              Subroutines
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+# Subroutine to handle the SNMP responses.
+#-------------------------------------------------------------------------------
+sub table_cb 
+{
+	my ($session, $table) = @_;
+
+	if (!defined($session->var_bind_list)) {
+                printf("ERROR: %s\n", $session->error);
+
+	} else {
+
+		#---------------------------------------------------------------
+                # Loop through each of the OIDs in the response and assign
+                # the key/value pairs to the anonymous hash that is passed
+                # to the callback.  Make sure that we are still in the table
+                # before assigning the key/values.
+		#---------------------------------------------------------------
+
+                my $next;
+                foreach my $oid (oid_lex_sort(keys(%{$session->var_bind_list}))) {
+                   	if (!oid_base_match($base_oid, $oid)) {
+                      		$next = undef;
+                      		last;
+                   	}
+                   	$next = $oid;
+                   	$table->{$oid} = $session->var_bind_list->{$oid};
+                }
+
+		#---------------------------------------------------------------
+                # If $next is defined we need to send another request
+                # to get more of the table.
+		#---------------------------------------------------------------
+
+                if (defined($next)) {
+                   	$result = $session->get_bulk_request(
+                      		-callback       => [\&table_cb, $table],
+                      		-maxrepetitions => 10,
+                      		-varbindlist    => [$next]
+                   	);
+
+			if (!defined($result)) {
+                 		printf("ERROR: %s\n", $session->error);
+			}
+                } else {
+			#-------------------------------------------------------
+                   	# We are no longer in the table, so print the results.
+			#-------------------------------------------------------
+			my @neighbors; 
+                   	foreach my $oid (oid_lex_sort(keys(%{$table}))) {
+
+				#-----------------------------------------------
+				# Get neighbor address and ifIndex from oid
+				#-----------------------------------------------
+				if ($oid =~ /^$base_oid.(\d+.\d+.\d+.\d+)$/) {
+					$neighbor = $1;
+				}
+				#print "$oid: $table->{$oid}\n";
+				#print "neighbor: $neighbor\n";
+
+				#-----------------------------------------------
+				# If this snmp response is about a neighbor that
+				# was listed in "-n", report on the status.
+				#-----------------------------------------------
+				if (defined($bgp_neighbors{$neighbor})) {
+					if ($table->{$oid} == 6) {
+						#print "BGP to $bgp_neighbors{$neighbor} is UP\n";
+						push(@up, $bgp_neighbors{$neighbor});
+					} else {
+						#print "BGP to $bgp_neighbors{$neighbor} is DOWN\n";
+						push(@down, $bgp_neighbors{$neighbor});
+						$state = 2;
+					}
+					#---------------------------------------
+					# deleting the neighbor from the hash
+					# since we already reported on it
+					#---------------------------------------
+					delete($bgp_neighbors{$neighbor});
+				}
+                   	}
+                }
+	}
+}
+

@@ -1,0 +1,278 @@
+#!/usr/bin/perl
+
+#===============================================================================
+#                               Configuration        
+#===============================================================================
+
+my $lastScriptModification = '2002-10-04';
+
+#===============================================================================
+#                              Initialization
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+#    Libraries
+#-------------------------------------------------------------------------------
+
+use Getopt::Std;
+use Net::SNMP qw(:snmp);
+
+
+#-------------------------------------------------------------------------------
+#    Global variable declarations
+#-------------------------------------------------------------------------------
+my (
+   # Working vars 
+   $usage,              # String containing usage help
+   $hostname,           # Hostname of machine being queried via SNMP
+   $community,          # SNMP community string to use for query
+   $isisISAdjState,     # ISIS adjacency state table OID 
+   $isisISAdjIPAddressType, # ISIS adjacency address type OID 
+   $isisISAdjIPAddress, # ISIS adjacency address OID 
+   $base_oid,           # ISIS OID 
+   %isis_neighbors,     # hash of OSPF neighbors
+   %isis_states,        # hash of SNMP OSPF states
+   @neighbors,		# array to temporarily hold the list of neighbors
+   @up,			# list of neighbors that are up
+   @down,		# list of neighbors that are down
+   $message,            # the text message to return to netsaint
+   $state              # 2=critical, 1=warning, 0=ok, -1=error
+);
+
+#-------------------------------------------------------------------------------
+#    Global variable initializations
+#-------------------------------------------------------------------------------
+
+$usage = <<"EOF";
+usage:  $0 [-h] -r <hostname> -c <community> -n <neighbors> 
+
+[-h]            :       Print this message
+[-r] <router>   :       IP Address or Hostname of the router
+[-c] <community>:       SNMP Community String  (default = "public")
+[-n] <neighbors>:       comma-separated list of neighbor ip addresses 
+                        and descriptions.   Example:  10.10.10.1%ROUTER_A
+                               
+$lastScriptModification
+ 
+EOF
+
+%isis_states = (
+	"0" => "Up",
+	"1" => "Initializing",
+	"2" => "Down",
+	"3" => "Failed",		
+);
+
+$state = 0;
+
+$base_oid               = "1.3.6.1.3.37.1.5";
+$isisISAdjState         = "1.3.6.1.3.37.1.5.1.1.2";
+$isisISAdjIPAddressType = "1.3.6.1.3.37.1.5.3.1.2";
+$isisISAdjIPAddress     = "1.3.6.1.3.37.1.5.3.1.3";
+
+#===============================================================================
+#                              Input Phase
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+# Check the usage
+#-------------------------------------------------------------------------------
+die $usage if (!getopts('hr:c:n:') || $opt_h);
+die $usage if (!$opt_r || !$opt_n || $opt_h);
+
+#-------------------------------------------------------------------------------
+# Set the args for the snmp session 
+#-------------------------------------------------------------------------------
+$hostname = $opt_r;
+$community = $opt_c || "public";
+
+#-------------------------------------------------------------------------------
+# Build a hash of ISIS neighbors: key=ip_address, value=description
+#-------------------------------------------------------------------------------
+@neighbors = split(',', $opt_n);
+foreach my $neighbor (@neighbors) {
+	my @tmp = split('\%', $neighbor);  
+	$isis_neighbors{$tmp[0]} = $tmp[1];
+}
+
+
+#-------------------------------------------------------------------------------
+# Open an SNMPv2 session with the router
+#-------------------------------------------------------------------------------
+my ($session, $error) = Net::SNMP->session(
+	-version     => 'snmpv2c',
+	-nonblocking => 1,
+	-timeout     => 2,
+    	-hostname    => $hostname,
+    	-community   => $community
+);
+
+if (!defined($session)) {
+	printf("ERROR: %s.\n", $error);
+	exit (-1);
+}
+
+
+#-------------------------------------------------------------------------------
+# Send a bulk request for the whole isis table
+#-------------------------------------------------------------------------------
+my $result = $session->get_bulk_request(
+	-callback       => [\&table_cb, {}],
+       	-maxrepetitions => 10,
+   	-varbindlist => [$base_oid]
+);
+
+if (!defined($result)) {
+	printf("ERROR: %s.\n", $session->error);
+	$session->close;
+	exit (-1);
+}
+
+#===============================================================================
+#                              Output Phase
+#===============================================================================
+
+
+#-------------------------------------------------------------------------------
+# Wait for the responses.  These will be handled by &table_cb...
+#-------------------------------------------------------------------------------
+snmp_dispatcher();
+
+#-------------------------------------------------------------------------------
+# Clean-up and exit.
+#-------------------------------------------------------------------------------
+$session->close;
+
+#---------------------------------------------------------------
+# If there are any neighbors left in the hash, it means that 
+# we were supposed to report on the status, but the neighbor
+# wasn't in the isis neighbors table.  We'll assume this means 
+# the neighbor is down.
+#---------------------------------------------------------------
+foreach my $neighbor (keys %isis_neighbors) {
+	#print "OSPF to $isis_neighbors{$neighbor} is DOWN\n";
+	push(@down, $isis_neighbors{$neighbor});
+	$state = 2;
+}
+
+#-------------------------------------------------------------------------------
+# If $state == 0, it means all the isis adjacencies were up...report accordingly
+#-------------------------------------------------------------------------------
+
+if ($state == 0) { 
+	my $num_up = @up;
+	my $list = join(',', @up);
+	if ($num_up > 1) {
+		$message = "Links to $list are Up";
+	} else {
+		$message = "Link to $list is Up";
+	}
+		
+#-------------------------------------------------------------------------------
+# Otherwise there adjacencies down.  Just report which ones are down.
+#-------------------------------------------------------------------------------
+} else {
+	my $num_down = @down;
+	my $list = join(',', @down);
+	if ($num_down > 1) {
+		$message = "Links to $list are DOWN";
+	} else {
+		$message = "Link to $list is DOWN";
+	}
+}
+
+print "$message\n";
+
+exit($state);
+
+
+#===============================================================================
+#                              Subroutines
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+# Subroutine to handle the SNMP responses.
+#-------------------------------------------------------------------------------
+sub table_cb 
+{
+	my ($session, $table) = @_;
+
+	if (!defined($session->var_bind_list)) {
+                printf("ERROR: %s\n", $session->error);
+
+	} else {
+
+		#---------------------------------------------------------------
+                # Loop through each of the OIDs in the response and assign
+                # the key/value pairs to the anonymous hash that is passed
+                # to the callback.  Make sure that we are still in the table
+                # before assigning the key/values.
+		#---------------------------------------------------------------
+
+                my $next;
+                foreach my $oid (oid_lex_sort(keys(%{$session->var_bind_list}))) {
+                   	if (!oid_base_match($base_oid, $oid)) {
+                      		$next = undef;
+                      		last;
+                   	}
+                   	$next = $oid;
+                   	$table->{$oid} = $session->var_bind_list->{$oid};
+                }
+
+		#---------------------------------------------------------------
+                # If $next is defined we need to send another request
+                # to get more of the table.
+		#---------------------------------------------------------------
+
+                if (defined($next)) {
+                   	$result = $session->get_bulk_request(
+                      		-callback       => [\&table_cb, $table],
+                      		-maxrepetitions => 10,
+                      		-varbindlist    => [$next]
+                   	);
+
+			if (!defined($result)) {
+                 		printf("ERROR: %s\n", $session->error);
+			}
+                } else {
+			#-------------------------------------------------------
+                   	# We are no longer in the table, so print the results.
+			#-------------------------------------------------------
+			my @neighbors; 
+                   	foreach my $oid (oid_lex_sort(keys(%{$table}))) {
+
+				#-----------------------------------------------
+				# Grab the index into the isisAdjTable... 
+				#-----------------------------------------------
+				if ($oid =~ /^$isisISAdjIPAddressType.(\d+.\d+.\d+).(\d+)$/) {
+					my $adj_index = $1;
+					my $addr_index = $2;
+
+					# skip unless this is a v4 address
+					#next unless ($table->{$oid} == 1);
+
+					# grab the ip address and store
+					my $neighbor = $table->{"$isisISAdjIPAddress.$adj_index.$addr_index"};
+
+					# if the address was in the -n option...
+					if (defined($isis_neighbors{$neighbor})) {
+
+						# ...and the state is up
+						if ($table->{$isisISAdjState.$index} == 0) {
+							#print "ISIS to $isis_neighbors{$neighbor} is UP\n";
+                                                	push(@up, $isis_neighbors{$neighbor});
+
+						# ...and the state is not up
+						} else {
+                                                	#print "ISIS to $isis_neighbors{$neigbor} is DOWN\n";
+                                                	push(@down, $isis_neighbors{$neighbor});
+                                                	$state = 2;
+						}
+					}
+					delete($isis_neighbors{$neighbor});
+				}
+			}
+                }
+	}
+}
+

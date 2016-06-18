@@ -1,0 +1,265 @@
+#!/usr/bin/perl
+
+#===============================================================================
+#                               Configuration        
+#===============================================================================
+
+my $lastScriptModification = '2002-10-01';
+
+#===============================================================================
+#                              Initialization
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+#    Libraries
+#-------------------------------------------------------------------------------
+
+use Getopt::Std;
+use Net::SNMP qw(:snmp);
+
+
+#-------------------------------------------------------------------------------
+#    Global var declarations
+#-------------------------------------------------------------------------------
+my (
+   # Working vars 
+   $usage,              # String containing usage help
+   $hostname,           # Hostname of machine being queried via SNMP
+   $community,          # SNMP community string to use for query
+   $base_oid,           # OSPF Neighbor State OID 
+   %ospf_neighbors,     # hash of OSPF neighbors
+   %ospf_states,        # hash of SNMP OSPF states
+   @neighbors,		# array to temporarily hold the list of neighbors
+   @up,			# list of neighbors that are up
+   @down,		# list of neighbors that are down
+   $message,            # the text message to return to netsaint
+   $state              # 2=critical, 1=warning, 0=ok, -1=error
+);
+
+#-------------------------------------------------------------------------------
+#    Global var initializations
+#-------------------------------------------------------------------------------
+
+$usage = <<"EOF";
+usage:  $0 [-h] -r <hostname> -c <community> -n <neighbors> 
+
+[-h]            :       Print this message
+[-r] <router>   :       IP Address or Hostname of the router
+[-c] <community>:       SNMP Community String  (default = "public")
+[-n] <neighbors>:       comma-separated list of neighbor ip addresses 
+                        and descriptions.   Example:  10.10.10.1:ROUTER_A
+                               
+$lastScriptModification
+ 
+EOF
+
+%ospf_states = (
+	"1" => "Down",
+	"2" => "Attempt",
+	"3" => "Init",		
+	"4" => "Two-Way",
+	"5" => "ExchangeStart",
+	"6" => "Exchange",
+	"7" => "Loading",
+	"8" => "Full"
+);
+
+$state = 0;
+
+#===============================================================================
+#                              Input Phase
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+# Check the usage
+#-------------------------------------------------------------------------------
+die $usage if (!getopts('hr:c:n:') || $opt_h);
+die $usage if (!$opt_r || !$opt_n || $opt_h);
+
+#-------------------------------------------------------------------------------
+# Set the args for the snmp session 
+#-------------------------------------------------------------------------------
+$hostname = $opt_r;
+$community = $opt_c || "public";
+$base_oid = "1.3.6.1.2.1.14.10.1.6";
+
+#-------------------------------------------------------------------------------
+# Build a hash of OSPF neighbors: key=ip_address, value=description
+#-------------------------------------------------------------------------------
+@neighbors = split(',', $opt_n);
+foreach my $neighbor (@neighbors) {
+	my @tmp = split('\:', $neighbor);  
+	$ospf_neighbors{$tmp[0]} = $tmp[1];
+}
+
+
+#-------------------------------------------------------------------------------
+# Open an SNMPv2 session with the router
+#-------------------------------------------------------------------------------
+my ($session, $error) = Net::SNMP->session(
+	-version     => 'snmpv2c',
+	-nonblocking => 1,
+	-timeout     => 2,
+    	-hostname    => $hostname,
+    	-community   => $community
+);
+
+if (!defined($session)) {
+	printf("ERROR: %s.\n", $error);
+	exit (-1);
+}
+
+
+#-------------------------------------------------------------------------------
+# Send a bulk request for the ospf neighbor table
+#-------------------------------------------------------------------------------
+my $result = $session->get_bulk_request(
+	-callback       => [\&table_cb, {}],
+       	-maxrepetitions => 10,
+   	-varbindlist => [$base_oid]
+);
+
+if (!defined($result)) {
+	printf("ERROR: %s.\n", $session->error);
+	$session->close;
+	exit (-1);
+}
+
+#===============================================================================
+#                              Output Phase
+#===============================================================================
+
+
+#-------------------------------------------------------------------------------
+# Wait for the responses.  These will be handled by &table_cb...
+#-------------------------------------------------------------------------------
+snmp_dispatcher();
+
+#-------------------------------------------------------------------------------
+# Clean-up and exit.
+#-------------------------------------------------------------------------------
+$session->close;
+
+if ($state == 0) { 
+	my $num_up = @up;
+	my $list = join(',', @up);
+	if ($num_up > 1) {
+		$message = "Links to $list are Up";
+	} else {
+		$message = "Link to $list is Up";
+	}
+		
+} else {
+	my $num_down = @down;
+	my $list = join(',', @down);
+	if ($num_down > 1) {
+		$message = "Links to $list are DOWN";
+	} else {
+		$message = "Link to $list is DOWN";
+	}
+}
+
+print "$message\n";
+
+exit($state);
+
+
+#===============================================================================
+#                              Subroutines
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+# Subroutine to handle the SNMP responses.
+#-------------------------------------------------------------------------------
+sub table_cb 
+{
+	my ($session, $table) = @_;
+
+	if (!defined($session->var_bind_list)) {
+                printf("ERROR: %s\n", $session->error);
+
+	} else {
+
+		#---------------------------------------------------------------
+                # Loop through each of the OIDs in the response and assign
+                # the key/value pairs to the anonymous hash that is passed
+                # to the callback.  Make sure that we are still in the table
+                # before assigning the key/values.
+		#---------------------------------------------------------------
+
+                my $next;
+                foreach my $oid (oid_lex_sort(keys(%{$session->var_bind_list}))) {
+                   	if (!oid_base_match($base_oid, $oid)) {
+                      		$next = undef;
+                      		last;
+                   	}
+                   	$next = $oid;
+                   	$table->{$oid} = $session->var_bind_list->{$oid};
+                }
+
+		#---------------------------------------------------------------
+                # If $next is defined we need to send another request
+                # to get more of the table.
+		#---------------------------------------------------------------
+
+                if (defined($next)) {
+                   	$result = $session->get_bulk_request(
+                      		-callback       => [\&table_cb, $table],
+                      		-maxrepetitions => 10,
+                      		-varbindlist    => [$next]
+                   	);
+
+			if (!defined($result)) {
+                 		printf("ERROR: %s\n", $session->error);
+			}
+                } else {
+			#-------------------------------------------------------
+                   	# We are no longer in the table, so print the results.
+			#-------------------------------------------------------
+			my @neighbors; 
+                   	foreach my $oid (oid_lex_sort(keys(%{$table}))) {
+
+				#-----------------------------------------------
+				# Get neighbor address and ifIndex from oid
+				#-----------------------------------------------
+				my $temp = $oid;
+				$temp =~ s/^$base_oid.(.*)$/$1/;
+				$temp =~ /^(\d+.\d+.\d+.\d+).(\d+)/;
+				my $neighbor = $1;
+				my $ifIndex = $2;
+
+				#-----------------------------------------------
+				# If this snmp response is about a neighbor that
+				# was listed in "-n", report on the status.
+				#-----------------------------------------------
+				if (defined($ospf_neighbors{$neighbor})) {
+					if ($table->{$oid} == 8) {
+						#print "OSPF to $ospf_neighbors{$neighbor} is UP\n";
+						push(@up, $ospf_neighbors{$neighbor});
+					} else {
+						#print "OSPF to $ospf_neighbors{$neighbor} is DOWN\n";
+						push(@down, $ospf_neighbors{$neighbor});
+						$state = 2;
+					}
+					#---------------------------------------
+					# deleting the neighbor from the hash
+					# since we already reported on it
+					#---------------------------------------
+					delete($ospf_neighbors{$neighbor});
+				}
+                   	}
+                }
+		#---------------------------------------------------------------
+                # If there are any neighbors left in the has, it means that 
+		# we were supposed to report on the status, but the neighbor
+		# wasn't in the ospf neighbors table.  We'll assume this means 
+                # the neighbor is down.
+		#---------------------------------------------------------------
+		foreach my $neighbor (keys %ospf_neighbors) {
+			#print "OSPF to $ospf_neighbors{$neighbor} is DOWN\n";
+			push(@down, $ospf_neighbors{$neighbor});
+			$state = 2;
+		}
+	}
+}
+

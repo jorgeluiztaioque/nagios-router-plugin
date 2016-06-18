@@ -1,0 +1,113 @@
+#!/usr/bin/perl 
+# -*- perl -*-
+
+#===============================================================================
+# Name
+#   check_msdp
+#
+# Description
+#   Checks the status of a MSDP peering session.
+#   Returns text to STDOUT and return code to be used by the netsaint process
+#
+# TODO
+#
+# Author
+#  Original author Matthew Davy (mpd@iu.edu)
+#
+# Copyright
+#  Copyright (c) 2001 The Trustees of Indiana University.
+#  All Rights Reserved.
+#===============================================================================
+
+#===============================================================================
+#                               Configuration        
+#===============================================================================
+
+my $lastScriptModification = '2001-08-10';
+
+#===============================================================================
+#                              Initialization
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+#    Libraries
+#-------------------------------------------------------------------------------
+
+use Getopt::Std;
+
+
+#-------------------------------------------------------------------------------
+#    Global var declarations
+#-------------------------------------------------------------------------------
+my (
+   # Working vars 
+   $usage,		# String containing usage help
+   $hostname,		# Hostname of machine being queried via SNMP
+   $community,		# SNMP community string to use for query
+   $oid			# MSDP Neighbor State OID + Peer IP Address
+   );
+
+#-------------------------------------------------------------------------------
+#    Global var initializations
+#-------------------------------------------------------------------------------
+
+$usage = <<"EOF";
+usage:  $0 [-h] -r <hostname> -c <community> -p <peer>
+
+[-h]            :       Print this message
+[-r] <router>   :       IP Address or Hostname of the router
+[-c] <community>:       SNMP Community String  (default = "public")
+[-p] <peer>     :       IP address of the BGP peer
+                               
+$lastScriptModification
+ 
+EOF
+
+#===============================================================================
+#                              Input Phase
+#===============================================================================
+
+# Check the usage
+die $usage if (!getopts('hr:c:p:') || $opt_h);
+die $usage if (!$opt_r || !$opt_p || $opt_h);
+
+# Build the args for the check_snmp command 
+$hostname = $opt_r;
+$community = $opt_c || "public";
+$oid = ".1.3.6.1.3.92.1.1.5.1.3.$opt_p";
+
+# Call the check_snmp command with the appropriate args
+$_ = `/usr/local/libexec/nagios/check_snmp -H $hostname -C $community -o $oid`;
+
+
+#===============================================================================
+#                              Output Phase
+#===============================================================================
+
+# Print a line to STDOUT and generate an exit code based on what the 
+# check_snmp command returns.
+
+if (/SNMP OK - 1/) {
+        print "MSDP Neighbor Inactive (1)\n";
+        exit(2);
+} elsif (/SNMP OK - 2/) {
+        print "MSDP Neighbor Listen (2)\n";
+        exit(2);
+} elsif (/SNMP OK - 3/) {
+        print "MSDP Neighbor Connecting (3)\n";
+        exit(2);
+} elsif (/SNMP OK - 4/) {
+        print "MSDP Neighbor Established (4)\n";
+        exit(0);
+} elsif (/SNMP OK - 5/) {
+        print "MSDP Neighbor Disabled (5)\n";
+        exit(1);
+} else {
+	print "Error: No response from $hostname\n";
+	exit(-1);
+}
+
+# should never get here
+print "Error: check_msdp script malfunctioned\n";
+exit(-1);
+
