@@ -1,6 +1,6 @@
-           INDIANA UNIVERSITY GLOBAL NETWORK OPERATIONS CENTER
-   	     NAGIOS PLUGINS --- VERSION 1.0 --- AUGUST, 2003
-                      http://tools.abilene.iu.edu/
+
+   	     		NAGIOS PLUGINS
+
 -------------------------------------------------------------------------------
 
 Description:
@@ -61,3 +61,8 @@ usage:  ./check_bgp [-h] -r <hostname> -c <community> -n <neighbors>
 [-c] <community>:       SNMP Community String  (default = "public")
 [-n] <neighbors>:       % delimited list of neighbor ip addresses 
                         and descriptions.   Example:  10.10.10.1%ROUTER_A
+
+
+------------------------
+ THE FIRST IS CREATED BY INDIANA UNIVERSITY GLOBAL NETWORK OPERATIONS CENTER
+
